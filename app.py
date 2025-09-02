@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-app.py — Bot BTC/USDC pour Railway
-- Variables faciles à modifier depuis Railway (ENV prioritaire)
-- Option: fichier config.json (secondaire)
-- Écrit les trades & bilans dans Google Sheets
-- Stratégie simple: RSI + écart EMA, TP/SL, gardes-fous
+app.py — Bot BTC/USDC pour Railway (ENV prioritaire)
+- Modifiable facilement via variables d'environnement Railway
+- Optionnel: config.json (utilisé seulement si une variable n'est pas en ENV)
+- Journalisation vers Google Sheets: trades, PnL jour, PnL semaine
+- Stratégie simple: RSI + écart EMA, TP/SL, garde-fous
 
-⚠️ Aucune garantie de profit. Utilisation à vos risques.
+Start Command (Railway):  python app.py
 """
 
 import os, json, time, math, uuid, traceback
@@ -17,8 +17,9 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# Binance (Spot)
+# Binance Spot
 from binance.spot import Spot as BinanceClient
+
 # Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
@@ -27,66 +28,80 @@ UTC = timezone.utc
 def utcnow() -> datetime: return datetime.now(tz=UTC)
 
 # =========================
-# ======= CONFIG I/O ======
+# ===== Helpers ENV =======
 # =========================
 
-def as_bool(x: Any, default: bool = False) -> bool:
-    """Convertit de façon robuste divers formats (true/false, 1/0, yes/no, on/off, vrai/faux)."""
-    if x is None: return default
-    if isinstance(x, bool): return x
-    s = str(x).strip().lower()
-    return s in ("true","1","yes","y","on","vrai")
+def _env_raw(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Lit une variable ENV et retire les guillemets éventuels rajoutés par l'UI."""
+    v = os.getenv(name)
+    if v is None: return default
+    s = str(v).strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1].strip()
+    return s
 
-def parse_env_value(raw: Optional[str], default: Any = None) -> Any:
-    """Parsage simple pour ENV: bool, int/float, sinon texte."""
-    if raw is None: return default
-    s = raw.strip()
-    sl = s.lower()
-    # bool?
-    if sl in ("true","false","vrai","faux"):
-        return sl in ("true","vrai")
-    # number?
-    try:
-        if "." in s:
-            return float(s)
-        return int(s)
-    except:
-        return s
+def env_bool(name: str, default: bool = False) -> bool:
+    s = _env_raw(name, None)
+    if s is None: return default
+    return s.lower() in ("true","vrai","1","yes","y","on")
+
+def env_float(name: str, default: float = 0.0) -> float:
+    s = _env_raw(name, None)
+    if s is None: return default
+    try: return float(s)
+    except: return default
+
+def env_int(name: str, default: int = 0) -> int:
+    s = _env_raw(name, None)
+    if s is None: return default
+    try: return int(float(s))
+    except: return default
+
+# =========================
+# ===== Config file =======
+# =========================
 
 def load_config_file() -> Dict[str, Any]:
     path = os.getenv("CONFIG_PATH", "config.json")
     if not os.path.exists(path): return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
             print(f"[CONFIG] Chargé depuis {path}")
-            return data
+            return json.load(f)
     except Exception as e:
-        print("[CONFIG] Erreur lecture config.json:", e)
+        print("[CONFIG] Erreur:", e)
         return {}
 
 CFG = load_config_file()
 
 def cfg(key: str, default: Any = None) -> Any:
-    """ENV prioritaire, puis config.json, sinon défaut."""
+    """ENV prioritaire, sinon config.json, sinon défaut."""
     if key in os.environ:
-        return parse_env_value(os.getenv(key), default)
-    if key in CFG:
-        return CFG[key]
+        # Essaie bool, int/float, sinon renvoie la chaîne
+        raw = _env_raw(key, None)
+        if raw is None: return default
+        low = raw.lower()
+        if low in ("true","false","vrai","faux"):
+            return low in ("true","vrai")
+        try:
+            return float(raw) if "." in raw else int(raw)
+        except:
+            return raw
+    if key in CFG: return CFG[key]
     return default
 
 # =========================
-# ========= PARAMS ========
+# ====== Secrets ==========
 # =========================
 
-# Secrets: 2 façons — préférer SECRETS_JSON (clé Google + Binance)
-#   SECRETS_JSON = {
-#     "BINANCE_API_KEY": "...",
-#     "BINANCE_API_SECRET": "...",
-#     "GOOGLE_SERVICE_ACCOUNT_JSON": {...}
-#   }
 def load_secrets():
-    raw = os.getenv("SECRETS_JSON")
+    """
+    Deux options:
+      1) SECRETS_JSON (recommandé):
+         {"BINANCE_API_KEY":"...", "BINANCE_API_SECRET":"...", "GOOGLE_SERVICE_ACCOUNT_JSON":{...}}
+      2) Variables séparées: BINANCE_API_KEY, BINANCE_API_SECRET, GOOGLE_SERVICE_ACCOUNT_JSON
+    """
+    raw = _env_raw("SECRETS_JSON", None)
     if raw:
         try:
             data = json.loads(raw)
@@ -96,53 +111,54 @@ def load_secrets():
                 data.get("GOOGLE_SERVICE_ACCOUNT_JSON", {}),
             )
         except Exception as e:
-            print("[SECRETS] Impossible de parser SECRETS_JSON:", e)
-    # fallback: variables séparées
-    api = os.getenv("BINANCE_API_KEY", "")
-    sec = os.getenv("BINANCE_API_SECRET", "")
-    gjson_raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    gjson = {}
-    if gjson_raw:
-        try:
-            gjson = json.loads(gjson_raw) if isinstance(gjson_raw, str) else gjson_raw
-        except Exception as e:
-            print("[SECRETS] GOOGLE_SERVICE_ACCOUNT_JSON invalide:", e)
-    return api, sec, gjson
+            print("[SECRETS] SECRETS_JSON invalide:", e)
+    key = _env_raw("BINANCE_API_KEY", "")
+    sec = _env_raw("BINANCE_API_SECRET", "")
+    gsa_raw = _env_raw("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    gsa = {}
+    if gsa_raw:
+        try: gsa = json.loads(gsa_raw)
+        except Exception as e: print("[SECRETS] GOOGLE_SERVICE_ACCOUNT_JSON invalide:", e)
+    return key, sec, gsa
 
 BINANCE_API_KEY, BINANCE_API_SECRET, GOOGLE_SA_DICT = load_secrets()
 
-SYMBOL               = str(cfg("SYMBOL", "BTCUSDC"))
-QUOTE                = "USDC"
-BASE                 = "BTC"
+# =========================
+# ====== Paramètres =======
+# =========================
 
-# Flags & sécurité
-DRY_RUN              = as_bool(cfg("DRY_RUN", True), True)
-TRADING_ENABLED      = as_bool(cfg("TRADING_ENABLED", True), True)
-MAX_CONCURRENT_POS   = int(cfg("MAX_CONCURRENT_POSITIONS", 1))
-DAILY_MAX_LOSS_USDC  = float(cfg("DAILY_MAX_LOSS_USDC", 15))
-CONSECUTIVE_LOSS_LIMIT = int(cfg("CONSECUTIVE_LOSS_LIMIT", 3))
-COOLDOWN_MINUTES     = int(cfg("COOLDOWN_MINUTES", 60))
-MIN_USDC_RESERVE     = float(cfg("MIN_USDC_RESERVE", 0))  # garder un fond de USDC
+SYMBOL                  = str(cfg("SYMBOL", "BTCUSDC"))
+QUOTE                   = "USDC"
+BASE                    = "BTC"
+
+# Modes & garde-fous
+DRY_RUN                 = env_bool("DRY_RUN", True)
+TRADING_ENABLED         = env_bool("TRADING_ENABLED", True)
+MAX_CONCURRENT_POS      = env_int("MAX_CONCURRENT_POSITIONS", 1)
+DAILY_MAX_LOSS_USDC     = env_float("DAILY_MAX_LOSS_USDC", 15)
+CONSECUTIVE_LOSS_LIMIT  = env_int("CONSECUTIVE_LOSS_LIMIT", 3)
+COOLDOWN_MINUTES        = env_int("COOLDOWN_MINUTES", 60)
+MIN_USDC_RESERVE        = env_float("MIN_USDC_RESERVE", 0)
 
 # Stratégie
-INTERVAL             = str(cfg("INTERVAL", "1m"))
-EMA_PERIOD           = int(cfg("EMA_PERIOD", 50))
-RSI_PERIOD           = int(cfg("RSI_PERIOD", 14))
-RSI_BUY              = float(cfg("RSI_BUY", 33))
-EMA_DEV_BUY_PCT      = float(cfg("EMA_DEV_BUY_PCT", 0.0015))
+INTERVAL                = str(cfg("INTERVAL", "1m"))
+EMA_PERIOD              = env_int("EMA_PERIOD", 50)
+RSI_PERIOD              = env_int("RSI_PERIOD", 14)
+RSI_BUY                 = env_float("RSI_BUY", 33)
+EMA_DEV_BUY_PCT         = env_float("EMA_DEV_BUY_PCT", 0.0015)
 
 # Ordres
-ORDER_USDC           = float(cfg("ORDER_USDC", 500))
-TAKE_PROFIT_PCT      = float(cfg("TAKE_PROFIT_PCT", 0.006))
-STOP_LOSS_PCT        = float(cfg("STOP_LOSS_PCT", 0.004))
+ORDER_USDC              = env_float("ORDER_USDC", 500)
+TAKE_PROFIT_PCT         = env_float("TAKE_PROFIT_PCT", 0.006)
+STOP_LOSS_PCT           = env_float("STOP_LOSS_PCT", 0.004)
 
 # Boucle
-LOOP_SLEEP_SECONDS   = int(cfg("LOOP_SLEEP_SECONDS", 15))
+LOOP_SLEEP_SECONDS      = env_int("LOOP_SLEEP_SECONDS", 15)
 
 # Google Sheets
-GSHEET_ID            = str(cfg("GSHEET_ID", ""))
+GSHEET_ID               = str(cfg("GSHEET_ID", ""))
 
-# Debug d’entrée
+# Debug d'entrée
 print("ENV DEBUG:", {
   "DRY_RUN": os.getenv("DRY_RUN"),
   "TRADING_ENABLED": os.getenv("TRADING_ENABLED"),
@@ -151,7 +167,7 @@ print("ENV DEBUG:", {
   "STOP_LOSS_PCT": os.getenv("STOP_LOSS_PCT"),
   "DAILY_MAX_LOSS_USDC": os.getenv("DAILY_MAX_LOSS_USDC"),
   "CONSECUTIVE_LOSS_LIMIT": os.getenv("CONSECUTIVE_LOSS_LIMIT"),
-  "SYMBOL": os.getenv("SYMBOL"),
+  "SYMBOL": os.getenv("SYMBOL")
 })
 print("CFG DEBUG:", {
   "DRY_RUN": CFG.get("DRY_RUN"),
@@ -161,11 +177,11 @@ print("CFG DEBUG:", {
   "STOP_LOSS_PCT": CFG.get("STOP_LOSS_PCT"),
   "DAILY_MAX_LOSS_USDC": CFG.get("DAILY_MAX_LOSS_USDC"),
   "CONSECUTIVE_LOSS_LIMIT": CFG.get("CONSECUTIVE_LOSS_LIMIT"),
-  "SYMBOL": CFG.get("SYMBOL"),
+  "SYMBOL": CFG.get("SYMBOL")
 })
 
 # =========================
-# ===== GOOGLE SHEETS =====
+# ===== Google Sheets =====
 # =========================
 
 def init_gsheets():
@@ -225,7 +241,7 @@ def gs_read_df(sheet_name):
         return pd.DataFrame()
 
 # =========================
-# ====== BINANCE I/O ======
+# ======= Binance I/O =====
 # =========================
 
 def new_binance_client():
@@ -308,7 +324,7 @@ def market_sell(qty):
     return client.new_order(symbol=SYMBOL, side="SELL", type="MARKET", quantity=str(qty))
 
 # =========================
-# ===== INDICATEURS =======
+# ====== Indicateurs =====
 # =========================
 
 def compute_indicators():
@@ -331,7 +347,7 @@ def compute_indicators():
     return float(close.iloc[-1]), float(ema.iloc[-1]), float(rsi.iloc[-1])
 
 # =========================
-# ====== ÉTAT / PNL =======
+# ====== État / PnL =======
 # =========================
 
 positions = []  # [{id, qty, entry, tp, sl, tp_order_id}]
@@ -385,7 +401,7 @@ def do_daily_and_weekly_summaries_if_needed():
         last_week_summary = week_start
 
 # =========================
-# ====== LOGIQUE BOT ======
+# ===== Logique bot =======
 # =========================
 
 def can_open_new_position():
@@ -486,7 +502,7 @@ def main_loop():
             manage_positions()
             time.sleep(LOOP_SLEEP_SECONDS)
         except KeyboardInterrupt:
-            print("Arrêt demandé.")
+            print("Arrêt utilisateur.")
             break
         except Exception as e:
             print("[LOOP ERROR]", e)
