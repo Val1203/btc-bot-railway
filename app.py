@@ -31,7 +31,7 @@ QUOTE = "USDC"
 BASE = "BTC"
 
 # --- Modes & Garde-fous ---
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"        # true = pas d'ordres réels
+DRY_RUN = False   # force le mode réel, ignore la variable Railway
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"  # kill switch
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
 DAILY_MAX_LOSS_USDC = float(os.getenv("DAILY_MAX_LOSS_USDC", "15"))
