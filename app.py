@@ -25,6 +25,14 @@ from google.oauth2.service_account import Credentials
 # =========================
 # ====== CONFIG ENV =======
 # =========================
+def as_bool(x, default=False):
+    if x is None:
+        return default
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    # accepte true/false, 1/0, yes/no, on/off, vrai/faux
+    return s in ("true", "1", "yes", "y", "on", "vrai")
 
 SYMBOL = os.getenv("SYMBOL", "BTCUSDC")
 QUOTE = "USDC"
