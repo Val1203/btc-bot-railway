@@ -39,8 +39,8 @@ QUOTE = "USDC"
 BASE = "BTC"
 
 # --- Modes & Garde-fous ---
-DRY_RUN = False   # force le mode réel, ignore la variable Railway
-TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"  # kill switch
+DRY_RUN = as_bool(os.getenv("DRY_RUN", "true"), True)
+TRADING_ENABLED = as_bool(os.getenv("TRADING_ENABLED", "true"), True)
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
 DAILY_MAX_LOSS_USDC = float(os.getenv("DAILY_MAX_LOSS_USDC", "15"))
 MIN_USDC_RESERVE = float(os.getenv("MIN_USDC_RESERVE", "0"))     # réserve à ne jamais utiliser
