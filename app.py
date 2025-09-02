@@ -1,115 +1,194 @@
 # -*- coding: utf-8 -*-
 """
-Bot spot BTC/USDC pour Railway – simple, modulable et avec garde-fous.
-- Montant par trade modifiable via la variable d'environnement ORDER_USDC.
-- Journalisation dans Google Sheets: trades, PnL jour, PnL semaine.
-- Garde-fous: DRY_RUN, DAILY_MAX_LOSS_USDC, MAX_CONCURRENT_POSITIONS,
-  limite de pertes consécutives + cooldown, kill switch TRADING_ENABLED.
-!!! AUCUNE GARANTIE DE PROFIT. UTILISATION À VOS RISQUES. !!!
+app.py — Bot BTC/USDC pour Railway
+- Variables faciles à modifier depuis Railway (ENV prioritaire)
+- Option: fichier config.json (secondaire)
+- Écrit les trades & bilans dans Google Sheets
+- Stratégie simple: RSI + écart EMA, TP/SL, gardes-fous
+
+⚠️ Aucune garantie de profit. Utilisation à vos risques.
 """
 
-import os, time, json, math, uuid, traceback
+import os, json, time, math, uuid, traceback
 from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
+import pandas as pd
 from dateutil.relativedelta import relativedelta
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-import pandas as pd
-
-# Binance
+# Binance (Spot)
 from binance.spot import Spot as BinanceClient
-
 # Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
-# =========================
-# ====== CONFIG ENV =======
-# =========================
-def as_bool(x, default=False):
-    if x is None:
-        return default
-    if isinstance(x, bool):
-        return x
-    s = str(x).strip().lower()
-    # accepte true/false, 1/0, yes/no, on/off, vrai/faux
-    return s in ("true", "1", "yes", "y", "on", "vrai")
-
-SYMBOL = os.getenv("SYMBOL", "BTCUSDC")
-QUOTE = "USDC"
-BASE = "BTC"
-
-# --- Modes & Garde-fous ---
-DRY_RUN = as_bool(os.getenv("DRY_RUN", "true"), True)
-TRADING_ENABLED = as_bool(os.getenv("TRADING_ENABLED", "true"), True)
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
-DAILY_MAX_LOSS_USDC = float(os.getenv("DAILY_MAX_LOSS_USDC", "15"))
-MIN_USDC_RESERVE = float(os.getenv("MIN_USDC_RESERVE", "0"))     # réserve à ne jamais utiliser
-
-# Perte consécutive & cooldown
-CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
-
-# --- Paramètres stratégie ---
-INTERVAL = os.getenv("INTERVAL", "1m")
-EMA_PERIOD = int(os.getenv("EMA_PERIOD", "50"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_BUY = float(os.getenv("RSI_BUY", "33"))
-EMA_DEV_BUY_PCT = float(os.getenv("EMA_DEV_BUY_PCT", "0.0015"))
-
-ORDER_USDC = float(os.getenv("ORDER_USDC", "15"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.006"))   # 0.6%
-STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0.004"))     # 0.4%
-
-LOOP_SLEEP_SECONDS = int(os.getenv("LOOP_SLEEP_SECONDS", "15"))
-
-# --- Binance keys (Railway Variables) ---
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-
-# --- Google Sheets ---
-GSHEET_ID = os.getenv("GSHEET_ID", "")
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-
 UTC = timezone.utc
-
-def utcnow():
-    return datetime.now(tz=UTC)
-
-def today_utc_date():
-    return utcnow().date()
-
-def start_of_week(d):  # Monday
-    return d - timedelta(days=d.weekday())
-
-def pct(a, b):
-    return (a - b) / b if b else 0.0
+def utcnow() -> datetime: return datetime.now(tz=UTC)
 
 # =========================
-# === GOOGLE SHEETS I/O ===
+# ======= CONFIG I/O ======
+# =========================
+
+def as_bool(x: Any, default: bool = False) -> bool:
+    """Convertit de façon robuste divers formats (true/false, 1/0, yes/no, on/off, vrai/faux)."""
+    if x is None: return default
+    if isinstance(x, bool): return x
+    s = str(x).strip().lower()
+    return s in ("true","1","yes","y","on","vrai")
+
+def parse_env_value(raw: Optional[str], default: Any = None) -> Any:
+    """Parsage simple pour ENV: bool, int/float, sinon texte."""
+    if raw is None: return default
+    s = raw.strip()
+    sl = s.lower()
+    # bool?
+    if sl in ("true","false","vrai","faux"):
+        return sl in ("true","vrai")
+    # number?
+    try:
+        if "." in s:
+            return float(s)
+        return int(s)
+    except:
+        return s
+
+def load_config_file() -> Dict[str, Any]:
+    path = os.getenv("CONFIG_PATH", "config.json")
+    if not os.path.exists(path): return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            print(f"[CONFIG] Chargé depuis {path}")
+            return data
+    except Exception as e:
+        print("[CONFIG] Erreur lecture config.json:", e)
+        return {}
+
+CFG = load_config_file()
+
+def cfg(key: str, default: Any = None) -> Any:
+    """ENV prioritaire, puis config.json, sinon défaut."""
+    if key in os.environ:
+        return parse_env_value(os.getenv(key), default)
+    if key in CFG:
+        return CFG[key]
+    return default
+
+# =========================
+# ========= PARAMS ========
+# =========================
+
+# Secrets: 2 façons — préférer SECRETS_JSON (clé Google + Binance)
+#   SECRETS_JSON = {
+#     "BINANCE_API_KEY": "...",
+#     "BINANCE_API_SECRET": "...",
+#     "GOOGLE_SERVICE_ACCOUNT_JSON": {...}
+#   }
+def load_secrets():
+    raw = os.getenv("SECRETS_JSON")
+    if raw:
+        try:
+            data = json.loads(raw)
+            return (
+                data.get("BINANCE_API_KEY", ""),
+                data.get("BINANCE_API_SECRET", ""),
+                data.get("GOOGLE_SERVICE_ACCOUNT_JSON", {}),
+            )
+        except Exception as e:
+            print("[SECRETS] Impossible de parser SECRETS_JSON:", e)
+    # fallback: variables séparées
+    api = os.getenv("BINANCE_API_KEY", "")
+    sec = os.getenv("BINANCE_API_SECRET", "")
+    gjson_raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    gjson = {}
+    if gjson_raw:
+        try:
+            gjson = json.loads(gjson_raw) if isinstance(gjson_raw, str) else gjson_raw
+        except Exception as e:
+            print("[SECRETS] GOOGLE_SERVICE_ACCOUNT_JSON invalide:", e)
+    return api, sec, gjson
+
+BINANCE_API_KEY, BINANCE_API_SECRET, GOOGLE_SA_DICT = load_secrets()
+
+SYMBOL               = str(cfg("SYMBOL", "BTCUSDC"))
+QUOTE                = "USDC"
+BASE                 = "BTC"
+
+# Flags & sécurité
+DRY_RUN              = as_bool(cfg("DRY_RUN", True), True)
+TRADING_ENABLED      = as_bool(cfg("TRADING_ENABLED", True), True)
+MAX_CONCURRENT_POS   = int(cfg("MAX_CONCURRENT_POSITIONS", 1))
+DAILY_MAX_LOSS_USDC  = float(cfg("DAILY_MAX_LOSS_USDC", 15))
+CONSECUTIVE_LOSS_LIMIT = int(cfg("CONSECUTIVE_LOSS_LIMIT", 3))
+COOLDOWN_MINUTES     = int(cfg("COOLDOWN_MINUTES", 60))
+MIN_USDC_RESERVE     = float(cfg("MIN_USDC_RESERVE", 0))  # garder un fond de USDC
+
+# Stratégie
+INTERVAL             = str(cfg("INTERVAL", "1m"))
+EMA_PERIOD           = int(cfg("EMA_PERIOD", 50))
+RSI_PERIOD           = int(cfg("RSI_PERIOD", 14))
+RSI_BUY              = float(cfg("RSI_BUY", 33))
+EMA_DEV_BUY_PCT      = float(cfg("EMA_DEV_BUY_PCT", 0.0015))
+
+# Ordres
+ORDER_USDC           = float(cfg("ORDER_USDC", 500))
+TAKE_PROFIT_PCT      = float(cfg("TAKE_PROFIT_PCT", 0.006))
+STOP_LOSS_PCT        = float(cfg("STOP_LOSS_PCT", 0.004))
+
+# Boucle
+LOOP_SLEEP_SECONDS   = int(cfg("LOOP_SLEEP_SECONDS", 15))
+
+# Google Sheets
+GSHEET_ID            = str(cfg("GSHEET_ID", ""))
+
+# Debug d’entrée
+print("ENV DEBUG:", {
+  "DRY_RUN": os.getenv("DRY_RUN"),
+  "TRADING_ENABLED": os.getenv("TRADING_ENABLED"),
+  "ORDER_USDC": os.getenv("ORDER_USDC"),
+  "TAKE_PROFIT_PCT": os.getenv("TAKE_PROFIT_PCT"),
+  "STOP_LOSS_PCT": os.getenv("STOP_LOSS_PCT"),
+  "DAILY_MAX_LOSS_USDC": os.getenv("DAILY_MAX_LOSS_USDC"),
+  "CONSECUTIVE_LOSS_LIMIT": os.getenv("CONSECUTIVE_LOSS_LIMIT"),
+  "SYMBOL": os.getenv("SYMBOL"),
+})
+print("CFG DEBUG:", {
+  "DRY_RUN": CFG.get("DRY_RUN"),
+  "TRADING_ENABLED": CFG.get("TRADING_ENABLED"),
+  "ORDER_USDC": CFG.get("ORDER_USDC"),
+  "TAKE_PROFIT_PCT": CFG.get("TAKE_PROFIT_PCT"),
+  "STOP_LOSS_PCT": CFG.get("STOP_LOSS_PCT"),
+  "DAILY_MAX_LOSS_USDC": CFG.get("DAILY_MAX_LOSS_USDC"),
+  "CONSECUTIVE_LOSS_LIMIT": CFG.get("CONSECUTIVE_LOSS_LIMIT"),
+  "SYMBOL": CFG.get("SYMBOL"),
+})
+
+# =========================
+# ===== GOOGLE SHEETS =====
 # =========================
 
 def init_gsheets():
-    if not GSHEET_ID or not GOOGLE_SA_JSON:
-        print("[GSheets] Variables manquantes (GSHEET_ID / GOOGLE_SERVICE_ACCOUNT_JSON). Logs console uniquement.")
+    if not GSHEET_ID or not GOOGLE_SA_DICT:
+        print("[GSheets] GSHEET_ID ou Service Account JSON manquant → logs console uniquement.")
         return None, None, None
     try:
-        sa_info = json.loads(GOOGLE_SA_JSON)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        creds = Credentials.from_service_account_info(GOOGLE_SA_DICT, scopes=scopes)
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(GSHEET_ID)
-        ws_names = [ws.title for ws in sh.worksheets()]
+        ws_names = [w.title for w in sh.worksheets()]
         if "trades" not in ws_names:
             sh.add_worksheet("trades", rows=1000, cols=20)
             sh.worksheet("trades").append_row(
-                ["ts", "date", "side", "qty_base", "price", "quote_value", "fee_quote", "position_id", "pnl_quote"]
+                ["ts","date","side","qty_base","price","quote_value","fee_quote","position_id","pnl_quote"]
             )
         if "daily_pnl" not in ws_names:
             sh.add_worksheet("daily_pnl", rows=500, cols=10)
-            sh.worksheet("daily_pnl").append_row(["date", "pnl_quote"])
+            sh.worksheet("daily_pnl").append_row(["date","pnl_quote"])
         if "weekly_pnl" not in ws_names:
             sh.add_worksheet("weekly_pnl", rows=200, cols=10)
-            sh.worksheet("weekly_pnl").append_row(["week_start_date", "week_end_date", "pnl_quote"])
+            sh.worksheet("weekly_pnl").append_row(["week_start_date","week_end_date","pnl_quote"])
         return sh, sh.worksheet("trades"), sh.worksheet("daily_pnl")
     except Exception as e:
         print("[GSheets] Erreur init:", e)
@@ -119,28 +198,24 @@ SHEET, WS_TRADES, WS_DAILY = init_gsheets()
 
 def gs_append_trades(row):
     try:
-        if WS_TRADES:
-            WS_TRADES.append_row(row, value_input_option="USER_ENTERED")
+        if WS_TRADES: WS_TRADES.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         print("[GSheets] append trades:", e)
 
 def gs_append_daily(date_str, pnl):
     try:
-        if SHEET:
-            SHEET.worksheet("daily_pnl").append_row([date_str, pnl], value_input_option="USER_ENTERED")
+        if SHEET: SHEET.worksheet("daily_pnl").append_row([date_str, pnl], value_input_option="USER_ENTERED")
     except Exception as e:
         print("[GSheets] append daily:", e)
 
 def gs_append_weekly(week_start, week_end, pnl):
     try:
-        if SHEET:
-            SHEET.worksheet("weekly_pnl").append_row([week_start, week_end, pnl], value_input_option="USER_ENTERED")
+        if SHEET: SHEET.worksheet("weekly_pnl").append_row([week_start, week_end, pnl], value_input_option="USER_ENTERED")
     except Exception as e:
         print("[GSheets] append weekly:", e)
 
 def gs_read_df(sheet_name):
-    if not SHEET:
-        return pd.DataFrame()
+    if not SHEET: return pd.DataFrame()
     try:
         ws = SHEET.worksheet(sheet_name)
         data = ws.get_all_records()
@@ -150,7 +225,7 @@ def gs_read_df(sheet_name):
         return pd.DataFrame()
 
 # =========================
-# ====== BINANCE API ======
+# ====== BINANCE I/O ======
 # =========================
 
 def new_binance_client():
@@ -160,11 +235,7 @@ def new_binance_client():
 
 client = new_binance_client()
 
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type(Exception)
-)
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10), retry=retry_if_exception_type(Exception))
 def get_klines(symbol, interval="1m", limit=200):
     return client.klines(symbol, interval, limit=limit)
 
@@ -182,7 +253,6 @@ FILTERS = get_filters(SYMBOL)
 
 def round_step(value, step):
     step = float(step)
-    # Avoid floating modulo issues
     return math.floor(float(value) / step) * step
 
 def format_qty_price(qty, price):
@@ -206,29 +276,27 @@ def place_market_buy_usdc(usdc_amount):
         qty, _ = format_qty_price(qty, px)
         return {
             "symbol": SYMBOL, "side": "BUY", "type": "MARKET",
-            "fills": [{"price": str(px), "qty": str(qty), "commissionAsset": QUOTE, "commission": "0.0"}],
-            "executedQty": str(qty), "cummulativeQuoteQty": str(qty * px)
+            "fills": [{"price": str(px), "qty": str(qty)}],
+            "executedQty": str(qty), "cummulativeQuoteQty": str(qty * px),
         }
     return client.new_order(symbol=SYMBOL, side="BUY", type="MARKET", quoteOrderQty=str(usdc_amount))
 
 def place_limit_sell(qty, price):
     qty, price = format_qty_price(qty, price)
     if DRY_RUN:
-        return {"orderId": int(uuid.uuid4().int % 1_000_000_000), "status": "NEW", "origQty": str(qty), "price": str(price)}
+        return {"orderId": 1, "status": "NEW", "origQty": str(qty), "price": str(price)}
     return client.new_order(symbol=SYMBOL, side="SELL", type="LIMIT", timeInForce="GTC",
                             quantity=str(qty), price=str(price))
 
 def cancel_order(order_id):
-    if DRY_RUN:
-        return
+    if DRY_RUN: return
     try:
         client.cancel_order(symbol=SYMBOL, orderId=order_id)
     except Exception:
         pass
 
 def get_order(order_id):
-    if DRY_RUN:
-        return {"status": "NEW"}
+    if DRY_RUN: return {"status": "NEW"}
     return client.get_order(symbol=SYMBOL, orderId=order_id)
 
 def market_sell(qty):
@@ -250,57 +318,58 @@ def compute_indicators():
     df["close"] = df["close"].astype(float)
     close = df["close"].astype(float)
 
+    # EMA
     ema = close.ewm(span=EMA_PERIOD, adjust=False).mean()
 
+    # RSI
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(RSI_PERIOD).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
     rs = gain / (loss.replace(0, 1e-9))
     rsi = 100 - (100 / (1 + rs))
+
     return float(close.iloc[-1]), float(ema.iloc[-1]), float(rsi.iloc[-1])
 
 # =========================
 # ====== ÉTAT / PNL =======
 # =========================
 
-positions = []  # [{id, qty, entry, tp, sl, tp_order_id or None}]
+positions = []  # [{id, qty, entry, tp, sl, tp_order_id}]
 daily_realized_pnl = 0.0
-current_day = today_utc_date()
-
+current_day = utcnow().date()
 consecutive_losses = 0
-cooldown_until = None  # datetime UTC
-
-last_week_summary = None
+cooldown_until: Optional[datetime] = None
+last_week_summary: Optional[datetime] = None
 
 def record_trade(side, qty, price, position_id, pnl_quote=None, fee_quote=0.0):
     global daily_realized_pnl, consecutive_losses, cooldown_until
     quote_value = qty * price
     ts = utcnow().isoformat()
-    date_str = str(today_utc_date())
+    date_str = str(utcnow().date())
     row = [ts, date_str, side, qty, price, quote_value, fee_quote, position_id, pnl_quote if pnl_quote is not None else ""]
     print("[TRADE]", row)
     gs_append_trades(row)
     if pnl_quote is not None:
         daily_realized_pnl += pnl_quote
-        # gestion des pertes consécutives
         if pnl_quote < 0:
             consecutive_losses += 1
             if CONSECUTIVE_LOSS_LIMIT > 0 and consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
                 cooldown_until = utcnow() + timedelta(minutes=COOLDOWN_MINUTES)
-                print(f"[GUARD] {consecutive_losses} pertes consécutives. Cooldown jusqu'à {cooldown_until.isoformat()}")
+                print(f"[GUARD] {consecutive_losses} pertes consécutives → pause jusqu'à {cooldown_until.isoformat()}")
         else:
-            consecutive_losses = 0  # reset au moindre gain
+            consecutive_losses = 0
 
 def do_daily_and_weekly_summaries_if_needed():
     global current_day, daily_realized_pnl, last_week_summary
-    today = today_utc_date()
+    today = utcnow().date()
+    # Daily
     if today != current_day:
         gs_append_daily(str(current_day), daily_realized_pnl)
         print(f"[DAILY] {current_day} PNL = {daily_realized_pnl:.2f} {QUOTE}")
         daily_realized_pnl = 0.0
         current_day = today
-
-    week_start = start_of_week(today)
+    # Weekly (lundi → récap semaine précédente)
+    week_start = today - timedelta(days=today.weekday())
     if last_week_summary is None:
         last_week_summary = week_start
     if week_start > last_week_summary:
@@ -312,7 +381,7 @@ def do_daily_and_weekly_summaries_if_needed():
             mask = (df["date"] >= pd.Timestamp(prev_week_start)) & (df["date"] <= pd.Timestamp(prev_week_end))
             pnl = df.loc[mask, "pnl_quote"].apply(lambda x: float(x) if str(x) not in ("", "None") else 0.0).sum()
             gs_append_weekly(str(prev_week_start), str(prev_week_end), float(pnl))
-            print(f"[WEEKLY] {prev_week_start} -> {prev_week_end} PNL = {pnl:.2f} {QUOTE}")
+            print(f"[WEEKLY] {prev_week_start} → {prev_week_end} PNL = {pnl:.2f} {QUOTE}")
         last_week_summary = week_start
 
 # =========================
@@ -323,22 +392,21 @@ def can_open_new_position():
     if not TRADING_ENABLED:
         print("[GUARD] TRADING_ENABLED=false → pas d'achats.")
         return False
-    if len(positions) >= MAX_CONCURRENT_POSITIONS:
+    if len(positions) >= MAX_CONCURRENT_POS:
         return False
-    # daily loss guard
+    # Perte journalière max
     df = gs_read_df("trades")
     if not df.empty:
-        today_str = str(today_utc_date())
-        df_today = df[df["date"] == today_str]
-        loss_today = df_today["pnl_quote"].apply(lambda x: float(x) if str(x) not in ("", "None") else 0.0).sum()
+        today_str = str(utcnow().date())
+        loss_today = df[df["date"] == today_str]["pnl_quote"].apply(lambda x: float(x) if str(x) not in ("", "None") else 0.0).sum()
         if loss_today <= -DAILY_MAX_LOSS_USDC:
             print("[GUARD] Perte journalière max atteinte → on stoppe les entrées aujourd'hui.")
             return False
-    # cooldown après pertes consécutives
+    # Cooldown
     global cooldown_until
     if cooldown_until and utcnow() < cooldown_until:
         return False
-    # réserve USDC
+    # Réserve USDC
     bal = account_balances()["USDC"]
     if bal != float("inf") and (bal - ORDER_USDC) < MIN_USDC_RESERVE:
         print("[GUARD] Réserve USDC atteinte, pas d'achat.")
@@ -361,10 +429,8 @@ def maybe_open_position():
                 avg_price = float(order["cummulativeQuoteQty"]) / qty
             else:
                 fills = order.get("fills", [])
-                if not fills:
-                    return
-                qty = float(fills[0]["qty"])
-                avg_price = float(fills[0]["price"])
+                if not fills: return
+                qty = float(fills[0]["qty"]); avg_price = float(fills[0]["price"])
             qty, _ = format_qty_price(qty, avg_price)
             tp_price = avg_price * (1 + TAKE_PROFIT_PCT)
             sl_price = avg_price * (1 - STOP_LOSS_PCT)
@@ -382,11 +448,11 @@ def manage_positions():
     for pos in list(positions):
         try:
             px = get_price(SYMBOL)
-            # Take Profit
+            # TP atteint ?
             tp_hit = False
             if pos["tp_order_id"] is not None:
                 od = get_order(pos["tp_order_id"])
-                tp_hit = od.get("status") == "FILLED"
+                tp_hit = (od.get("status") == "FILLED")
             if DRY_RUN and px >= pos["tp"]:
                 tp_hit = True
             if tp_hit:
@@ -395,7 +461,7 @@ def manage_positions():
                 record_trade("SELL", pos["qty"], sell_price, pos["id"], pnl_quote=pnl)
                 positions.remove(pos)
                 continue
-            # Stop Loss
+            # SL atteint ?
             if px <= pos["sl"]:
                 if pos["tp_order_id"]:
                     cancel_order(pos["tp_order_id"])
