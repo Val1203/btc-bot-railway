@@ -24,6 +24,50 @@ from binance.spot import Spot as BinanceClient
 import gspread
 from google.oauth2.service_account import Credentials
 
+# === helpers P&L (à coller juste après les imports) ===
+def _to_num(x):
+    """Nettoie et convertit en float (gère −, espaces insécables, virgule FR)."""
+    s = str(x).strip()
+    return float(
+        s.replace('−','-').replace('\u2212','-')
+         .replace('\u00a0','').replace('\u202f','').replace(' ','')
+         .replace(',', '.')
+    )
+
+PNL_MIN = 0.0  # mets 0.01 si tu veux ignorer les tous petits arrondis
+# ======================================================
+# === n'écrire QUE les trades avec P&L (SELL) à partir d'une ligne "row" ===
+# row = [ts, date, side, qty_base, price, quote_value, fee_quote, position_id, pnl_quote]
+def write_row_if_pnl_from_row(ws, row):
+    # sécurité
+    if not row or len(row) < 9:
+        return False
+
+    # extraire / normaliser
+    side = str(row[2]).upper()
+    try:
+        qty_base    = _to_num(row[3])
+        price       = _to_num(row[4])
+        quote_value = _to_num(row[5])
+        fee_quote   = _to_num(row[6])
+    except Exception:
+        return False
+
+    # P&L (peut être vide pour un BUY)
+    try:
+        pnl_num = _to_num(row[8])
+    except Exception:
+        pnl_num = None
+
+    # n’écrire QUE si c’est une VENTE avec P&L réel (gain ou perte)
+    if side == "SELL" and pnl_num is not None and abs(pnl_num) > PNL_MIN:
+        clean = [row[0], row[1], side, qty_base, price, quote_value, fee_quote, row[7], pnl_num]
+        ws.append_row(clean, value_input_option='RAW')
+        return True
+    return False
+# ========================================================================
+
+
 UTC = timezone.utc
 def utcnow() -> datetime: return datetime.now(tz=UTC)
 
@@ -364,7 +408,7 @@ def record_trade(side, qty, price, position_id, pnl_quote=None, fee_quote=0.0):
     date_str = str(utcnow().date())
     row = [ts, date_str, side, qty, price, quote_value, fee_quote, position_id, pnl_quote if pnl_quote is not None else ""]
     print("[TRADE]", row)
-    gs_append_trades(row)
+    write_row_if_pnl_from_row(WS_TRADES, row)   
     if pnl_quote is not None:
         daily_realized_pnl += pnl_quote
         if pnl_quote < 0:
