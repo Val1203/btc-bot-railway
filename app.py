@@ -22,7 +22,19 @@ from binance.spot import Spot as BinanceClient
 
 # Google Sheets
 import gspread
+
 from google.oauth2.service_account import Credentials
+from sheets_bootstrap_min import setup as sheets_setup
+
+try:
+    if os.getenv("GSHEET_ID") and os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        sheets_setup()
+        print("[GSheets] Bilan journalier prêt ✅")
+    else:
+        print("[GSheets] Variables manquantes, skip.")
+except Exception as e:
+    print("[GSheets] Setup error:", e)
+
 
 # === helpers P&L (à coller juste après les imports) ===
 def _to_num(x):
