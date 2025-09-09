@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import os
+import sys
 import time
 import uuid
 import logging
@@ -18,7 +19,7 @@ from zoneinfo import ZoneInfo
 # =========================
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
-TRADES_CSV_PATH = os.getenv("TRADES_CSV_PATH", "trades.csv")  # fermé par défaut
+TRADES_CSV_PATH = os.getenv("TRADES_CSV_PATH", "trades.csv")  # exemple de source locale
 
 def _D(x) -> Decimal:
     if isinstance(x, Decimal):
@@ -43,14 +44,36 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return False
     return default
 
+# ---------- Logger corrigé (stdout pour INFO/DEBUG, stderr pour WARNING+) ----------
+class MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int):
+        super().__init__()
+        self.max_level = max_level
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.max_level
+
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("bot")
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    fmt = "%(asctime)s | %(message)s"
-    handler.setFormatter(logging.Formatter(fmt))
+    logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
-    logger.addHandler(handler)
+
+    fmt = "%(asctime)s | %(message)s"
+    formatter = logging.Formatter(fmt)
+
+    # stdout: DEBUG & INFO
+    h_out = logging.StreamHandler(sys.stdout)
+    h_out.setLevel(logging.DEBUG)
+    h_out.addFilter(MaxLevelFilter(logging.WARNING))
+    h_out.setFormatter(formatter)
+
+    # stderr: WARNING, ERROR, CRITICAL
+    h_err = logging.StreamHandler(sys.stderr)
+    h_err.setLevel(logging.WARNING)
+    h_err.setFormatter(formatter)
+
+    logger.addHandler(h_out)
+    logger.addHandler(h_err)
+    logger.propagate = False
     return logger
 
 logger = setup_logger()
@@ -86,7 +109,7 @@ class Config:
             DAILY_LOSSES_LIMIT=_env_int("DAILY_LOSSES_LIMIT", 0),
             LOOP_SLEEP_SECONDS=_env_int("LOOP_SLEEP_SECONDS", 5),
         )
-        # Logs style "ENV DEBUG" / "CFG DEBUG" (comme tes captures)
+        # Logs style "ENV DEBUG" / "CFG DEBUG" (compatibles avec tes captures)
         env_debug = {
             "DRY_RUN": str(cfg.DRY_RUN).lower(),
             "TRADING_ENABLED": str(cfg.TRADING_ENABLED).lower(),
@@ -99,21 +122,22 @@ class Config:
             "SYMBOL": cfg.SYMBOL,
         }
         cfg_debug = {k: "Aucun" for k in env_debug.keys()}
+        logger.info(f"[GSheets] Bilan journalier prêt ✅")
         logger.info(f"ENV DEBUG : {env_debug}")
         logger.info(f"CFG DEBUG : {cfg_debug}")
         return cfg
 
 # =========================
-# Parsers & sources trades
+# Parsers & source trades
 # =========================
 
 def parse_iso_dt(s: str) -> datetime:
     """
-    Parse timestamps type:
-      - '2025-09-09T02:22:57.28924+00:00'
-      - '2025-09-09T02:22:57Z'
-      - '2025-09-09 02:22:57'
-    Retourne un datetime timezone-aware (UTC si non précisé).
+    Supporte:
+      '2025-09-09T02:22:57.28924+00:00'
+      '2025-09-09T02:22:57Z'
+      '2025-09-09 02:22:57'
+    Retourne un datetime aware (UTC si absent).
     """
     s = s.strip()
     try:
@@ -125,7 +149,6 @@ def parse_iso_dt(s: str) -> datetime:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
     except Exception:
-        # fallback tolérant
         try:
             dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             return dt
@@ -141,12 +164,10 @@ def paris_today_bounds(now: Optional[datetime] = None) -> Tuple[datetime, dateti
 
 def load_trades_today() -> List[Dict[str, Any]]:
     """
-    ⚠️ Par défaut lit un CSV local `trades.csv`.
-    Colonnes minimales:
-      closed_at,pnl_usdc
-    Exemple:
-      2025-09-09T02:22:57Z,-1.2311384
-    Adapte cette fonction à ta source réelle (GSheets / DB / API).
+    ⚠️ Exemple: lit un CSV local `trades.csv`.
+    Colonnes minimales: closed_at,pnl_usdc
+    Exemple ligne: 2025-09-09T02:22:57Z,-1.2311384
+    Adapte à ta vraie source (GSheets/DB/API) si besoin.
     """
     trades: List[Dict[str, Any]] = []
     if not os.path.exists(TRADES_CSV_PATH):
@@ -158,7 +179,6 @@ def load_trades_today() -> List[Dict[str, Any]]:
         for row in reader:
             try:
                 ts = parse_iso_dt(row["closed_at"])
-                # convertir en Europe/Paris pour le filtrage
                 ts_paris = ts.astimezone(PARIS_TZ)
                 if not (start <= ts_paris < end):
                     continue
@@ -171,7 +191,6 @@ def load_trades_today() -> List[Dict[str, Any]]:
                     }
                 )
             except Exception:
-                # ligne incomplète -> on ignore
                 continue
     return trades
 
@@ -252,7 +271,7 @@ class StopNotifier:
 
     def notify_once(self, message: str):
         if not self._already_sent:
-            logger.warning(message)
+            logger.warning(message)  # WARNING -> stderr (rouge)
             self._already_sent = True
 
 # =========================
@@ -261,18 +280,16 @@ class StopNotifier:
 
 def strategy_tick(cfg: Config) -> None:
     """
-    💡 ICI branche ta stratégie réelle:
+    Branche ici ta stratégie réelle :
       - récupération du prix / signaux
       - décision BUY/SELL
-      - envoi d'ordres si ALLOW_NEW_ENTRIES
-    Dans cet exemple, on ne place pas d'ordres (squelette propre).
+      - envoi d'ordres si autorisé
     """
-    # Exemple de log "heartbeat" stratégique :
+    # Exemple :
     # logger.info("[TICK] Vérification des signaux…")
     pass
 
 def main() -> None:
-    logger.info("[GSheets] Bilan journalier prêt ✅")  # pour rester fidèle à tes logs
     cfg = Config.from_env()
 
     logger.info(f"--- BOT démarré | DRY_RUN={'Faux' if not cfg.DRY_RUN else 'Vrai'} "
@@ -289,7 +306,8 @@ def main() -> None:
         notifier.reset_if_new_day(now_paris)
 
         trades_today = load_trades_today()
-        # Log récap quotidien (facultatif, décommenter si utile)
+
+        # (Optionnel) log du PnL du jour :
         # stats = summarize_day(trades_today)
         # logger.info(f"[QUOTIDIEN] {now_paris.strftime('%Y-%m-%d')} PNL = {stats['daily_pnl']:.2f} USDC")
 
@@ -301,14 +319,13 @@ def main() -> None:
         )
 
         if stop:
-            # On bloque seulement les NOUVELLES ENTRÉES pour aujourd'hui
+            # On bloque seulement les nouvelles entrées pour aujourd'hui
             notifier.notify_once(reason)
         else:
-            # Sécurité: on ne trade que si TRADING_ENABLED
             if cfg.TRADING_ENABLED:
                 strategy_tick(cfg)
 
-        # Toujours tourner (24/7), même quand on stoppe les entrées
+        # Tourne en continu (24/7), même quand on stoppe les entrées
         time.sleep(cfg.LOOP_SLEEP_SECONDS)
 
 # =========================
