@@ -1,0 +1,10 @@
+[build]
+builder = "NIXPACKS"
+
+[variables]
+PYTHONUNBUFFERED = "1"
+
+[deploy]
+startCommand = "python -u app.py"
+restartPolicyType = "ALWAYS"      # redémarre automatiquement
+restartPolicyMaxRetries = 0
