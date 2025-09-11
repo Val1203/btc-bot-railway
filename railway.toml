@@ -1,10 +1,13 @@
 [build]
 builder = "NIXPACKS"
 
-[variables]
+[env]
 PYTHONUNBUFFERED = "1"
 
-[deploy]
-startCommand = "python -u app.py"
-restartPolicyType = "ALWAYS"
-restartPolicyMaxRetries = 3
+[service]
+# redémarrage automatique si crash
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[variables]
+# (Optionnel) Pose ici des valeurs par défaut pour dev local
