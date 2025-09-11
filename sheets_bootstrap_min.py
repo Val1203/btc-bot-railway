@@ -1,82 +1,100 @@
-# sheets_bootstrap_min.py
-import os, json, time
+import json
+from datetime import datetime, timedelta
+from decimal import Decimal
+import pytz
 import gspread
-from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+# Scopes min nécessaires
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-def _client():
-    sa_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+def get_gsheet_client(service_json_str: str):
+    info = json.loads(service_json_str)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
-def _open():
-    return _client().open_by_key(os.environ["GSHEET_ID"])
-
-def _retry(fn, *args, **kwargs):
-    delay = 1.0
-    for _ in range(5):
-        try:
-            return fn(*args, **kwargs)
-        except Exception:
-            time.sleep(delay)
-            delay = min(delay * 2, 10)
-    # dernière tentative
-    return fn(*args, **kwargs)
-
-def setup():
-    """Crée/ouvre les feuilles 'trades', 'daily', 'weekly' et pose les en-têtes."""
+def ensure_worksheets(gc, gsheet_id):
+    sh = gc.open_by_key(gsheet_id)
+    # feuille 1: trades
     try:
-        sh = _open()
+        ws_trades = sh.worksheet("trades")
+    except gspread.WorksheetNotFound:
+        ws_trades = sh.add_worksheet(title="trades", rows=1000, cols=12)
+        ws_trades.append_row([
+            "timestamp", "symbol", "entry_price", "exit_price", "qty",
+            "pnl_usdc", "result", "day", "week_iso"
+        ])
+    # feuille 2: daily_summary
+    try:
+        ws_daily = sh.worksheet("daily_summary")
+    except gspread.WorksheetNotFound:
+        ws_daily = sh.add_worksheet(title="daily_summary", rows=365, cols=10)
+        ws_daily.append_row([
+            "day", "symbol", "trades", "wins", "losses", "pnl_usdc"
+        ])
+    # feuille 3: weekly_summary
+    try:
+        ws_weekly = sh.worksheet("weekly_summary")
+    except gspread.WorksheetNotFound:
+        ws_weekly = sh.add_worksheet(title="weekly_summary", rows=200, cols=10)
+        ws_weekly.append_row([
+            "week_iso", "symbol", "trades", "wins", "losses", "pnl_usdc"
+        ])
+    return ws_trades, ws_daily, ws_weekly
 
-        try:
-            trades = sh.worksheet("trades")
-        except WorksheetNotFound:
-            trades = sh.add_worksheet("trades", rows=1000, cols=20)
-            trades.append_row(
-                ["ts","date","side","qty_base","price","quote_value",
-                 "fee_quote","position_id","pnl_quote"]
-            )
+def append_trade_row(ws_trades, when_dt, symbol, entry_price, exit_price, qty, pnl_usdc, result):
+    d = when_dt.date().isoformat()
+    week_iso = f"{when_dt.isocalendar().year}-W{str(when_dt.isocalendar().week).zfill(2)}"
+    ws_trades.append_row([
+        when_dt.isoformat(),
+        symbol,
+        float(entry_price),
+        float(exit_price),
+        float(qty),
+        float(pnl_usdc),
+        result,            # "WIN" ou "LOSS"
+        d,
+        week_iso
+    ], value_input_option="USER_ENTERED")
 
-        try:
-            daily = sh.worksheet("daily")
-        except WorksheetNotFound:
-            daily = sh.add_worksheet("daily", rows=1000, cols=2)
-            daily.append_row(["date","pnl_quote"])
+def _aggregate(ws, key_col_name, key_value, symbol):
+    # lit toutes les lignes et agrège pour un jour ou une semaine
+    data = ws.spreadsheet.worksheet("trades").get_all_records()
+    trades = [r for r in data if r.get("result") in ("WIN","LOSS")
+              and r.get("symbol") == symbol
+              and r.get(key_col_name) == key_value]
+    pnl = sum([float(r.get("pnl_usdc", 0)) for r in trades])
+    wins = sum([1 for r in trades if r.get("result") == "WIN"])
+    losses = sum([1 for r in trades if r.get("result") == "LOSS"])
+    return dict(trades=len(trades), wins=wins, losses=losses, pnl_usdc=pnl)
 
-        try:
-            weekly = sh.worksheet("weekly")
-        except WorksheetNotFound:
-            weekly = sh.add_worksheet("weekly", rows=1000, cols=3)
-            weekly.append_row(["week_start_date","week_end_date","pnl_quote"])
-
-        print("[GSheets] Setup OK ✅")
-        return {"sh": sh, "trades": trades, "daily": daily, "weekly": weekly}
-    except Exception as e:
-        print("[GSheets] Setup error:", e)
-        return None
-
-def append_trade(row):
-    """Ajoute une ligne de trade dans l’onglet 'trades'."""
-    sh = _open()
-    ws = _retry(sh.worksheet, "trades")
-    _retry(ws.append_row, row, value_input_option="USER_ENTERED")
-
-def upsert_daily(date_str, pnl_quote):
-    """Insère ou met à jour le PnL du jour dans 'daily' (col B)."""
-    sh = _open()
-    ws = _retry(sh.worksheet, "daily")
-    values = ws.get_all_values()
+def _upsert_row(ws, key_name, key_value, symbol, agg):
+    rows = ws.get_all_records()
+    # cherche si ligne existe
     idx = None
-    for i in range(2, len(values) + 1):  # saute les en-têtes
-        if values[i - 1][0] == date_str:
+    for i, r in enumerate(rows, start=2):  # 1 = header
+        if r.get(key_name) == key_value and r.get("symbol") == symbol:
             idx = i
             break
+    values = [
+        key_value,
+        symbol,
+        agg["trades"],
+        agg["wins"],
+        agg["losses"],
+        round(agg["pnl_usdc"], 6)
+    ]
     if idx:
-        _retry(ws.update_cell, idx, 2, pnl_quote)
+        ws.update(f"A{idx}:F{idx}", [values])
     else:
-        _retry(ws.append_row, [date_str, pnl_quote], value_input_option="USER_ENTERED")
+        ws.append_row(values, value_input_option="USER_ENTERED")
+
+def upsert_daily_summary(ws_daily, day_iso, symbol):
+    agg = _aggregate(ws_daily, "day", day_iso, symbol)
+    _upsert_row(ws_daily, "day", day_iso, symbol, agg)
+
+def upsert_weekly_summary(ws_weekly, day_iso, symbol):
+    y, w, _ = datetime.fromisoformat(day_iso).isocalendar()
+    week_iso = f"{y}-W{str(w).zfill(2)}"
+    agg = _aggregate(ws_weekly, "week_iso", week_iso, symbol)
+    _upsert_row(ws_weekly, "week_iso", week_iso, symbol, agg)
