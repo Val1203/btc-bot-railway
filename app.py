@@ -22,7 +22,7 @@ from sheets_bootstrap_min import (
 )
 
 # -----------------------------
-# Logging propre 24/7
+# Logging
 # -----------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 # -----------------------------
-# Lecture ENV (Railway)
+# ENV (Railway)
 # -----------------------------
 def env(name, default=None, cast=str):
     v = os.getenv(name, default)
@@ -43,8 +43,8 @@ BINANCE_API_KEY       = env("BINANCE_API_KEY")
 BINANCE_API_SECRET    = env("BINANCE_API_SECRET")
 DRY_RUN               = env("DRY_RUN", "true", bool)
 TRADING_ENABLED       = env("TRADING_ENABLED", "false", bool)
-SYMBOL                = env("SYMBOL")                    # ex: "BTC/USDT"
-ORDER_USDC            = Decimal(env("ORDER_USDC", "10")) # montant par trade
+SYMBOL                = env("SYMBOL")                    # e.g. "BTC/USDT"
+ORDER_USDC            = Decimal(env("ORDER_USDC", "10")) # per-trade amount
 TAKE_PROFIT_PCT       = Decimal(env("TAKE_PROFIT_PCT", "0.6"))/Decimal(100)
 STOP_LOSS_PCT         = Decimal(env("STOP_LOSS_PCT", "0.4"))/Decimal(100)
 RSI_BUY               = int(env("RSI_BUY", "33"))
@@ -63,7 +63,7 @@ DAILY_LOSSES_LIMIT    = int(env("DAILY_LOSSES_LIMIT", "10"))
 DAY_RESET_TZ          = env("DAY_RESET_TZ", "Europe/Paris")
 
 # -----------------------------
-# Bourse/Exchange (ccxt)
+# Exchange (ccxt)
 # -----------------------------
 def build_exchange():
     params = {
@@ -77,7 +77,7 @@ def build_exchange():
 exchange = build_exchange()
 
 # -----------------------------
-# RSI & EMA
+# Indicators
 # -----------------------------
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -92,15 +92,15 @@ def ema(series: pd.Series, span: int = 20) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 # -----------------------------
-# Google Sheets client
+# Google Sheets
 # -----------------------------
 gc = get_gsheet_client(GOOGLE_SERVICE_JSON)
 ws_trades, ws_daily, ws_weekly = ensure_worksheets(gc, GSHEET_ID)
 
 # -----------------------------
-# État runtime
+# Runtime state
 # -----------------------------
-open_positions = []  # simple: une liste de dicts {"qty","entry","time"}
+open_positions = []  # list of dicts {"qty","entry","time"}
 consecutive_losses = 0
 trades_done_today = 0
 invested_capital = Decimal("0")
@@ -125,7 +125,7 @@ def new_day_reset():
 # -----------------------------
 # Utils
 # -----------------------------
-def quantize_price(p):   # arrondis simples
+def quantize_price(p):
     return Decimal(p).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
 def quantize_qty(qty):
@@ -137,7 +137,7 @@ def fetch_ohlcv(symbol, timeframe="1m", limit=200):
 
 def fetch_free_usdt():
     if DRY_RUN:
-        # Dans DRY_RUN, on suppose un capital large sauf MIN_USDC_RESERVE
+        # In DRY_RUN, pretend we have plenty of balance except MIN_USDC_RESERVE
         return Decimal("100000")
     balance = exchange.fetch_balance()
     for k in ("USDT","USDC","BUSD"):
@@ -151,15 +151,15 @@ def place_market_buy(symbol, usdc_amount):
     price = Decimal(str(get_last_price(symbol)))
     qty = (Decimal(usdc_amount) / price)
     order = exchange.create_market_buy_order(symbol, float(qty))
-    trade_price = Decimal(str(order['price'] or price))
-    filled = Decimal(str(order['cost'] or (qty*trade_price)))
+    trade_price = Decimal(str(order.get('price') or price))
+    filled = Decimal(str(order.get('cost') or (qty*trade_price)))
     return {"filled": float(filled), "price": float(trade_price)}
 
 def place_market_sell(symbol, qty):
     if DRY_RUN:
         return {"filled": float(qty), "price": float(get_last_price(symbol))}
     order = exchange.create_market_sell_order(symbol, float(qty))
-    trade_price = Decimal(str(order['price'] or get_last_price(symbol)))
+    trade_price = Decimal(str(order.get('price') or get_last_price(symbol)))
     return {"filled": float(qty), "price": float(trade_price)}
 
 def get_last_price(symbol):
@@ -167,7 +167,7 @@ def get_last_price(symbol):
     return float(ticker['last'])
 
 # -----------------------------
-# Règles d'entrée/sortie
+# Entry/Exit rules
 # -----------------------------
 def should_enter(prices: pd.Series) -> bool:
     r = rsi(prices).iloc[-1]
@@ -182,7 +182,7 @@ def exit_levels(entry_price: Decimal):
     return (tp, sl)
 
 # -----------------------------
-# Gestion des signaux système
+# Signals
 # -----------------------------
 RUNNING = True
 def handle_sigterm(signum, frame):
@@ -192,17 +192,17 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
 # -----------------------------
-# Boucle 24/7
+# Main loop 24/7
 # -----------------------------
-log.info("Bot démarré. DRY_RUN=%s TRADING_ENABLED=%s SYMBOL=%s", DRY_RUN, TRADING_ENABLED, SYMBOL)
+log.info("Bot started. DRY_RUN=%s TRADING_ENABLED=%s SYMBOL=%s", DRY_RUN, TRADING_ENABLED, SYMBOL)
 
 while RUNNING:
     try:
-        # Reset journalier à la TZ choisie
+        # Daily reset at selected TZ
         day_key = now_tz().strftime("%Y-%m-%d")
         if day_key != current_day_key:
-            # cloture des bilans jour/semaine à minuit TZ
-            upsert_daily_summary(ws_daily, day_key, SYMBOL)  # calcule si données existent
+            # finalize summaries at midnight
+            upsert_daily_summary(ws_daily, day_key, SYMBOL)
             upsert_weekly_summary(ws_weekly, day_key, SYMBOL)
             new_day_reset()
             current_day_key = day_key
@@ -213,27 +213,26 @@ while RUNNING:
         else:
             cooldown_until = None
 
-        # Sécurité : limites journalières
+        # Safety: daily limits
         if daily_pnl <= -DAILY_MAX_LOSS_USDC or daily_losses_count >= DAILY_LOSSES_LIMIT:
-            log.warning("Limite quotidienne atteinte. Pause jusqu’à minuit.")
-            # mise en cooldown très long (jusqu’à minuit)
+            log.warning("Daily limit reached. Cooling down until midnight.")
             tomorrow = (now_tz() + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
             cooldown_until = tomorrow
             time.sleep(5)
             continue
 
-        # Télécharger marché
+        # Market data
         ohlcv = fetch_ohlcv(SYMBOL, timeframe="1m", limit=200)
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
         prices = df["close"].astype(float)
 
-        # Gestion des positions existantes (take profit / stop loss)
+        # Manage open positions (TP/SL)
         last_price = Decimal(str(prices.iloc[-1]))
         still_open = []
         for pos in open_positions:
             tp, sl = exit_levels(pos["entry"])
             if last_price >= tp:
-                # sortie gagnante
+                # winner
                 sell_res = place_market_sell(SYMBOL, pos["qty"])
                 pnl = (Decimal(str(sell_res["price"])) - pos["entry"]) * pos["qty"]
                 daily_pnl += pnl
@@ -241,9 +240,9 @@ while RUNNING:
                 status = "WIN"
                 append_trade_row(ws_trades, now_tz(), SYMBOL, pos["entry"], Decimal(str(sell_res["price"])),
                                  pos["qty"], pnl, status)
-                log.info("TP atteint: +%.4f USDC", float(pnl))
+                log.info("Take profit: +%.4f USDC", float(pnl))
             elif last_price <= sl:
-                # sortie perdante
+                # loser
                 sell_res = place_market_sell(SYMBOL, pos["qty"])
                 pnl = (Decimal(str(sell_res["price"])) - pos["entry"]) * pos["qty"]
                 daily_pnl += pnl
@@ -252,14 +251,41 @@ while RUNNING:
                 status = "LOSS"
                 append_trade_row(ws_trades, now_tz(), SYMBOL, pos["entry"], Decimal(str(sell_res["price"])),
                                  pos["qty"], pnl, status)
-                log.info("SL touché: %.4f USDC", float(pnl))
+                log.info("Stop loss: %.4f USDC", float(pnl))
                 if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
-                    log.warning("Perte consécutive limite atteinte. Cooldown %d min.", COOLDOWN_MINUTES)
+                    log.warning("Consecutive loss limit reached. Cooldown %d min.", COOLDOWN_MINUTES)
                     cooldown_until = now_tz() + timedelta(minutes=COOLDOWN_MINUTES)
             else:
-                # conserver
                 still_open.append(pos)
         open_positions = still_open
 
-        # Entrées
-        if TRADING_ENABLED and len(open_positions) < MAX_CON_
+        # Entries
+        if TRADING_ENABLED and len(open_positions) < MAX_CONCURRENT_POSITIONS:
+            if trades_done_today < MAX_TRADES_PER_DAY and invested_capital + ORDER_USDC <= MAX_CAP_USDC:
+                free_usdt = fetch_free_usdt()
+                if free_usdt - ORDER_USDC >= MIN_USDC_RESERVE:
+                    if should_enter(prices):
+                        buy_res = place_market_buy(SYMBOL, ORDER_USDC)
+                        entry_price = Decimal(str(buy_res["price"]))
+                        qty = (ORDER_USDC / entry_price)
+                        qty = quantize_qty(qty)
+                        open_positions.append({"entry": entry_price, "qty": qty, "time": now_tz()})
+                        invested_capital += ORDER_USDC
+                        trades_done_today += 1
+                        log.info("Entry @ %s qty=%s (trades today: %d)", entry_price, qty, trades_done_today)
+
+        # Rolling summaries every ~60s
+        if int(time.time()) % 60 < 2:
+            upsert_daily_summary(ws_daily, now_tz().strftime("%Y-%m-%d"), SYMBOL)
+            upsert_weekly_summary(ws_weekly, now_tz().strftime("%Y-%m-%d"), SYMBOL)
+
+        time.sleep(4)
+
+    except ccxt.NetworkError as e:
+        log.warning("NetworkError: %s", e)
+        time.sleep(5)
+    except Exception as e:
+        log.exception("Main loop error: %s", e)
+        time.sleep(5)
+
+log.info("Bot stopped gracefully.")
