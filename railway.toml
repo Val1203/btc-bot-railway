@@ -6,5 +6,5 @@ PYTHONUNBUFFERED = "1"
 
 [deploy]
 startCommand = "python -u app.py"
-restartPolicyType = "ALWAYS"      # redémarre automatiquement
-restartPolicyMaxRetries = 0
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 3
