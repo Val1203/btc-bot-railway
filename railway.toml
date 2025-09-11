@@ -5,9 +5,5 @@ builder = "NIXPACKS"
 PYTHONUNBUFFERED = "1"
 
 [service]
-# redémarrage automatique si crash
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
-
-[variables]
-# (Optionnel) Pose ici des valeurs par défaut pour dev local
