@@ -8,15 +8,12 @@ import numpy as np
 import ccxt
 from tenacity import retry, wait_exponential, stop_after_attempt
 
-from sheets_bootstrap_min import (
-    get_gsheet_client,
-    ensure_worksheets,
-    append_trade_row,
-    upsert_daily_summary,
-    upsert_weekly_summary,
-)
+# Import en module (plus robuste que "from … import …")
+import sheets_bootstrap_min as sbm
 
-# -------- Logging -> stdout (pas de faux "rouge") --------
+# =========================
+# Logging -> stdout
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -24,7 +21,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# -------- Helpers ENV compatibles FR/EN --------
+# =========================
+# ENV helpers (FR/EN)
+# =========================
 TRUE_SET  = {"1","true","yes","on","vrai","oui","y","t"}
 FALSE_SET = {"0","false","no","off","faux","non","n","f"}
 
@@ -38,7 +37,6 @@ def env_bool(name, default="false"):
     v = str(env_raw(name, default)).strip().lower()
     if v in TRUE_SET:  return True
     if v in FALSE_SET: return False
-    # fallback: Python truthiness of non-empty strings is True -> mieux d'être explicite:
     return v not in ("",)
 
 def env_decimal(name, default):
@@ -46,48 +44,52 @@ def env_decimal(name, default):
 
 def normalize_symbol(sym: str) -> str:
     s = sym.strip().upper().replace(" ", "")
-    if "/" in s:  # déjà OK
+    if "/" in s:
         return s
-    # insérer un slash entre la base et le quote le plus courant
     QUOTES = ("USDT","USDC","BUSD","BTC","ETH","EUR","USD")
     for q in QUOTES:
         if s.endswith(q) and len(s) > len(q):
             return s[:-len(q)] + "/" + q
-    return s  # dernier recours
+    return s
 
-# -------- Lecture ENV (accepte SYMBOL ou SYMBOLE) --------
+# =========================
+# Lecture ENV (Railway)
+# =========================
 BINANCE_API_KEY    = env_raw("BINANCE_API_KEY")
 BINANCE_API_SECRET = env_raw("BINANCE_API_SECRET")
+
+# compat SYMBOLE
+_symbol_raw = os.getenv("SYMBOL") or os.getenv("SYMBOLE")
+if not _symbol_raw:
+    raise RuntimeError("Veuillez définir la variable 'SYMBOL' (ou 'SYMBOLE').")
+SYMBOL = normalize_symbol(_symbol_raw)
+
 DRY_RUN            = env_bool("DRY_RUN", "true")
 TRADING_ENABLED    = env_bool("TRADING_ENABLED", "false")
 
-_symbol_raw = os.getenv("SYMBOL") or os.getenv("SYMBOLE")
-if not _symbol_raw:
-    raise RuntimeError("Veuillez définir la variable Railway 'SYMBOL' (ou 'SYMBOLE').")
-SYMBOL = normalize_symbol(_symbol_raw)
-
-ORDER_USDC             = env_decimal("ORDER_USDC", "10")
+ORDER_USDC             = env_decimal("ORDER_USDC", "50")
 TAKE_PROFIT_PCT        = env_decimal("TAKE_PROFIT_PCT", "0.6")/Decimal(100)
 STOP_LOSS_PCT          = env_decimal("STOP_LOSS_PCT", "0.4")/Decimal(100)
-RSI_BUY                = int(env_raw("RSI_BUY", "33"))
-EMA_DEV_BUY_PCT        = env_decimal("EMA_DEV_BUY_PCT", "0.5")/Decimal(100)
-MAX_CAP_USDC           = env_decimal("MAX_CAP_USDC", "200")
-DAILY_TARGET_USDC      = env_decimal("DAILY_TARGET_USDC", "5")
-MAX_TRADES_PER_DAY     = int(env_raw("MAX_TRADES_PER_DAY", "20"))
-MIN_USDC_RESERVE       = env_decimal("MIN_USDC_RESERVE", "0")
+RSI_BUY                = int(env_raw("RSI_BUY", "40"))
+EMA_DEV_BUY_PCT        = env_decimal("EMA_DEV_BUY_PCT", "0.3")/Decimal(100)
+
+MAX_TRADES_PER_DAY     = int(env_raw("MAX_TRADES_PER_DAY", "18"))
 MAX_CONCURRENT_POSITIONS = int(env_raw("MAX_CONCURRENT_POSITIONS", "1"))
-DAILY_MAX_LOSS_USDC    = env_decimal("DAILY_MAX_LOSS_USDC", "20")
+
+MAX_CAP_USDC           = env_decimal("MAX_CAP_USDC", "600")
+MIN_USDC_RESERVE       = env_decimal("MIN_USDC_RESERVE", "0")
+DAILY_MAX_LOSS_USDC    = env_decimal("DAILY_MAX_LOSS_USDC", "30")
+DAILY_LOSSES_LIMIT     = int(env_raw("DAILY_LOSSES_LIMIT", "6"))
 CONSECUTIVE_LOSS_LIMIT = int(env_raw("CONSECUTIVE_LOSS_LIMIT", "3"))
-COOLDOWN_MINUTES       = int(env_raw("COOLDOWN_MINUTES", "30"))
-GSHEET_ID              = env_raw("GSHEET_ID")
-GOOGLE_SERVICE_JSON    = env_raw("GOOGLE_SERVICE_ACCOUNT_JSON")
-DAILY_LOSSES_LIMIT     = int(env_raw("DAILY_LOSSES_LIMIT", "10"))
+COOLDOWN_MINUTES       = int(env_raw("COOLDOWN_MINUTES", "45"))
 DAY_RESET_TZ           = env_raw("DAY_RESET_TZ", "Europe/Paris")
 
-# -------- Récap config propre --------
+GSHEET_ID              = env_raw("GSHEET_ID")
+GOOGLE_SERVICE_JSON    = env_raw("GOOGLE_SERVICE_ACCOUNT_JSON")
+
 log.info(
-    "CONFIG | SYMBOL=%s | ORDER_USDC=%s | TP=%.4f%% | SL=%.4f%% | RSI_BUY=%s | "
-    "EMA_DEV_BUY_PCT=%.4f%% | MAX_CAP_USDC=%s | MAX_TRADES_PER_DAY=%d | "
+    "CONFIGURATION | SYMBOL=%s | ORDER_USDC=%s | TP=%.4f %% | SL=%.4f %% | RSI_BUY=%s | "
+    "EMA_DEV_BUY_PCT=%.4f %% | MAX_CAP_USDC=%s | MAX_TRADES_PER_DAY=%d | "
     "MAX_CONCURRENT_POSITIONS=%d | DAILY_MAX_LOSS_USDC=%s | DAILY_LOSSES_LIMIT=%d | "
     "CONSECUTIVE_LOSS_LIMIT=%d | COOLDOWN_MINUTES=%d | TZ=%s | DRY_RUN=%s | TRADING_ENABLED=%s",
     SYMBOL, ORDER_USDC, float(TAKE_PROFIT_PCT*100), float(STOP_LOSS_PCT*100), RSI_BUY,
@@ -96,7 +98,9 @@ log.info(
     CONSECUTIVE_LOSS_LIMIT, COOLDOWN_MINUTES, DAY_RESET_TZ, DRY_RUN, TRADING_ENABLED
 )
 
-# -------- Exchange (ccxt) --------
+# =========================
+# Exchange (ccxt)
+# =========================
 def build_exchange():
     return ccxt.binance({
         "apiKey": BINANCE_API_KEY,
@@ -106,7 +110,9 @@ def build_exchange():
     })
 exchange = build_exchange()
 
-# -------- Indicateurs --------
+# =========================
+# Indicateurs
+# =========================
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     up = np.where(delta > 0, delta, 0.0)
@@ -119,17 +125,21 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 def ema(series: pd.Series, span: int = 20) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-# -------- Google Sheets --------
-gc = get_gsheet_client(GOOGLE_SERVICE_JSON)
-ws_trades, ws_daily, ws_weekly = ensure_worksheets(gc, GSHEET_ID)
+# =========================
+# Google Sheets
+# =========================
+gc = sbm.get_gsheet_client(GOOGLE_SERVICE_JSON)
+ws_trades, ws_daily, ws_weekly = sbm.ensure_worksheets(gc, GSHEET_ID)
 try:
     sh = gc.open_by_key(GSHEET_ID)
-    log.info("Google Sheets connecté | Spreadsheet: '%s' | Onglets: %s",
+    log.info("Google Sheets connecté | Tableur : '%s' | Onglets : %s",
              sh.title, ", ".join([w.title for w in sh.worksheets()]))
 except Exception as e:
     log.warning("Google Sheets initialisé, mais info feuille non lue: %s", e)
 
-# -------- État runtime --------
+# =========================
+# État runtime
+# =========================
 open_positions = []  # dicts {"qty","entry","time"}
 consecutive_losses = 0
 trades_done_today = 0
@@ -150,7 +160,9 @@ def new_day_reset():
     daily_losses_count = 0
     consecutive_losses = 0
 
-# -------- Utils --------
+# =========================
+# Utils
+# =========================
 def quantize_qty(qty):
     return Decimal(qty).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
@@ -158,7 +170,7 @@ def quantize_qty(qty):
 def fetch_ohlcv(symbol, timeframe="1m", limit=200):
     return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
-def fetch_free_usdt():
+def fetch_free_stables():
     if DRY_RUN:
         return Decimal("100000")
     bal = exchange.fetch_balance()
@@ -187,7 +199,9 @@ def place_market_sell(symbol, qty):
     trade_price = Decimal(str(order.get("price") or get_last_price(symbol)))
     return {"filled": float(qty), "price": float(trade_price)}
 
-# -------- Règles --------
+# =========================
+# Règles
+# =========================
 def should_enter(prices: pd.Series) -> bool:
     r = rsi(prices).iloc[-1]
     em = ema(prices).iloc[-1]
@@ -200,7 +214,9 @@ def exit_levels(entry_price: Decimal):
     sl = entry_price * (Decimal("1")-STOP_LOSS_PCT)
     return tp, sl
 
-# -------- Signals --------
+# =========================
+# Signals
+# =========================
 RUNNING = True
 def handle_sigterm(*_):
     global RUNNING
@@ -208,90 +224,10 @@ def handle_sigterm(*_):
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
-# -------- Boucle 24/7 --------
+# =========================
+# Boucle 24/7
+# =========================
 log.info("Bot démarré.")
 
 while RUNNING:
-    try:
-        # Reset journalier (TZ)
-        day_key = now_tz().strftime("%Y-%m-%d")
-        if day_key != current_day_key:
-            upsert_daily_summary(ws_daily, current_day_key, SYMBOL)
-            upsert_weekly_summary(ws_weekly, current_day_key, SYMBOL)
-            new_day_reset()
-            current_day_key = day_key
-
-        if cooldown_until and now_tz() < cooldown_until:
-            time.sleep(5); continue
-        else:
-            cooldown_until = None
-
-        # Limites journalières
-        if daily_pnl <= -DAILY_MAX_LOSS_USDC or daily_losses_count >= DAILY_LOSSES_LIMIT:
-            log.warning("Limites journalières atteintes. Pause jusqu'à minuit.")
-            tomorrow = (now_tz() + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
-            cooldown_until = tomorrow
-            time.sleep(5); continue
-
-        # Marché
-        ohlcv = fetch_ohlcv(SYMBOL, timeframe="1m", limit=200)
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-        prices = df["close"].astype(float)
-        last_price = Decimal(str(prices.iloc[-1]))
-
-        # Sorties TP/SL
-        still_open = []
-        for pos in open_positions:
-            tp, sl = exit_levels(pos["entry"])
-            if last_price >= tp:
-                sell_res = place_market_sell(SYMBOL, pos["qty"])
-                pnl = (Decimal(str(sell_res["price"])) - pos["entry"]) * pos["qty"]
-                daily_pnl += pnl
-                consecutive_losses = 0
-                append_trade_row(ws_trades, now_tz(), SYMBOL, pos["entry"], Decimal(str(sell_res["price"])),
-                                 pos["qty"], pnl, "WIN")
-                log.info("TP atteint: +%.4f USDC", float(pnl))
-            elif last_price <= sl:
-                sell_res = place_market_sell(SYMBOL, pos["qty"])
-                pnl = (Decimal(str(sell_res["price"])) - pos["entry"]) * pos["qty"]
-                daily_pnl += pnl
-                consecutive_losses += 1
-                daily_losses_count += 1
-                append_trade_row(ws_trades, now_tz(), SYMBOL, pos["entry"], Decimal(str(sell_res["price"])),
-                                 pos["qty"], pnl, "LOSS")
-                log.info("SL touché: %.4f USDC", float(pnl))
-                if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
-                    log.warning("Perte consécutive limite atteinte. Cooldown %d min.", COOLDOWN_MINUTES)
-                    cooldown_until = now_tz() + timedelta(minutes=COOLDOWN_MINUTES)
-            else:
-                still_open.append(pos)
-        open_positions = still_open
-
-        # Entrées
-        if TRADING_ENABLED and len(open_positions) < MAX_CONCURRENT_POSITIONS:
-            if trades_done_today < MAX_TRADES_PER_DAY and invested_capital + ORDER_USDC <= MAX_CAP_USDC:
-                free_usdt = fetch_free_usdt()
-                if free_usdt - ORDER_USDC >= MIN_USDC_RESERVE:
-                    if should_enter(prices):
-                        buy_res = place_market_buy(SYMBOL, ORDER_USDC)
-                        entry_price = Decimal(str(buy_res["price"]))
-                        qty = quantize_qty(ORDER_USDC / entry_price)
-                        open_positions.append({"entry": entry_price, "qty": qty, "time": now_tz()})
-                        invested_capital += ORDER_USDC
-                        trades_done_today += 1
-                        log.info("Entrée @ %s qty=%s (trades jour: %d)", entry_price, qty, trades_done_today)
-
-# Rolling summaries every ~5 minutes (réduit la charge API Google)
-if int(time.time()) % 300 < 2:
-    upsert_daily_summary(ws_daily, now_tz().strftime("%Y-%m-%d"), SYMBOL)
-    upsert_weekly_summary(ws_weekly, now_tz().strftime("%Y-%m-%d"), SYMBOL)
-
-
-        time.sleep(4)
-
-    except ccxt.NetworkError as e:
-        log.warning("NetworkError: %s", e); time.sleep(5)
-    except Exception as e:
-        log.exception("Erreur boucle principale: %s", e); time.sleep(5)
-
-log.info("Bot arrêté proprement.")
+    try
