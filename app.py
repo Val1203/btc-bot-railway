@@ -281,10 +281,11 @@ while RUNNING:
                         trades_done_today += 1
                         log.info("Entrée @ %s qty=%s (trades jour: %d)", entry_price, qty, trades_done_today)
 
-        # Bilan roulant (~60s)
-        if int(time.time()) % 60 < 2:
-            upsert_daily_summary(ws_daily, now_tz().strftime("%Y-%m-%d"), SYMBOL)
-            upsert_weekly_summary(ws_weekly, now_tz().strftime("%Y-%m-%d"), SYMBOL)
+# Rolling summaries every ~5 minutes (réduit la charge API Google)
+if int(time.time()) % 300 < 2:
+    upsert_daily_summary(ws_daily, now_tz().strftime("%Y-%m-%d"), SYMBOL)
+    upsert_weekly_summary(ws_weekly, now_tz().strftime("%Y-%m-%d"), SYMBOL)
+
 
         time.sleep(4)
 
