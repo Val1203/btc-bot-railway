@@ -230,4 +230,92 @@ signal.signal(signal.SIGINT, handle_sigterm)
 log.info("Bot démarré.")
 
 while RUNNING:
-    try
+    try:
+        # Reset journalier (TZ)
+        day_key = now_tz().strftime("%Y-%m-%d")
+        if day_key != current_day_key:
+            sbm.upsert_daily_summary(ws_daily, current_day_key, SYMBOL)
+            sbm.upsert_weekly_summary(ws_weekly, current_day_key, SYMBOL)
+            new_day_reset()
+            current_day_key = day_key
+
+        if cooldown_until and now_tz() < cooldown_until:
+            time.sleep(5); continue
+        else:
+            cooldown_until = None
+
+        # Limites journalières
+        if daily_pnl <= -DAILY_MAX_LOSS_USDC or daily_losses_count >= DAILY_LOSSES_LIMIT:
+            log.warning("Limites journalières atteintes. Pause jusqu'à minuit.")
+            tomorrow = (now_tz() + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+            cooldown_until = tomorrow
+            time.sleep(5); continue
+
+        # Marché
+        ohlcv = fetch_ohlcv(SYMBOL, timeframe="1m", limit=200)
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+        prices = df["close"].astype(float)
+        last_price = Decimal(str(prices.iloc[-1]))
+
+        # DEBUG raison d'entrée
+        r = rsi(prices).iloc[-1]
+        em = ema(prices).iloc[-1]
+        dev_pct = abs((em - prices.iloc[-1]) / em) * 100
+        log.info("DEBUG | last=%.2f | EMA=%.2f | dev=%.3f%% | RSI=%.1f",
+                 float(prices.iloc[-1]), float(em), float(dev_pct), float(r))
+
+        # Sorties TP/SL
+        still_open = []
+        for pos in open_positions:
+            tp, sl = exit_levels(pos["entry"])
+            if last_price >= tp:
+                sell_res = place_market_sell(SYMBOL, pos["qty"])
+                pnl = (Decimal(str(sell_res["price"])) - pos["entry"]) * pos["qty"]
+                daily_pnl += pnl
+                consecutive_losses = 0
+                sbm.append_trade_row(ws_trades, now_tz(), SYMBOL, pos["entry"], Decimal(str(sell_res["price"])),
+                                     pos["qty"], pnl, "WIN")
+                log.info("TP atteint: +%.4f USDC", float(pnl))
+            elif last_price <= sl:
+                sell_res = place_market_sell(SYMBOL, pos["qty"])
+                pnl = (Decimal(str(sell_res["price"])) - pos["entry"]) * pos["qty"]
+                daily_pnl += pnl
+                consecutive_losses += 1
+                daily_losses_count += 1
+                sbm.append_trade_row(ws_trades, now_tz(), SYMBOL, pos["entry"], Decimal(str(sell_res["price"])),
+                                     pos["qty"], pnl, "LOSS")
+                log.info("SL touché: %.4f USDC", float(pnl))
+                if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
+                    log.warning("Perte consécutive limite atteinte. Cooldown %d min.", COOLDOWN_MINUTES)
+                    cooldown_until = now_tz() + timedelta(minutes=COOLDOWN_MINUTES)
+            else:
+                still_open.append(pos)
+        open_positions = still_open
+
+        # Entrées
+        if TRADING_ENABLED and len(open_positions) < MAX_CONCURRENT_POSITIONS:
+            if trades_done_today < MAX_TRADES_PER_DAY and invested_capital + ORDER_USDC <= MAX_CAP_USDC:
+                free_stable = fetch_free_stables()
+                if free_stable - ORDER_USDC >= MIN_USDC_RESERVE:
+                    if should_enter(prices):
+                        buy_res = place_market_buy(SYMBOL, ORDER_USDC)
+                        entry_price = Decimal(str(buy_res["price"]))
+                        qty = quantize_qty(ORDER_USDC / entry_price)
+                        open_positions.append({"entry": entry_price, "qty": qty, "time": now_tz()})
+                        invested_capital += ORDER_USDC
+                        trades_done_today += 1
+                        log.info("Entrée @ %s qty=%s (trades jour: %d)", entry_price, qty, trades_done_today)
+
+        # Bilans toutes les 5 minutes (réduit charge API)
+        if int(time.time()) % 300 < 2:
+            sbm.upsert_daily_summary(ws_daily, now_tz().strftime("%Y-%m-%d"), SYMBOL)
+            sbm.upsert_weekly_summary(ws_weekly, now_tz().strftime("%Y-%m-%d"), SYMBOL)
+
+        time.sleep(4)
+
+    except ccxt.NetworkError as e:
+        log.warning("NetworkError: %s", e); time.sleep(5)
+    except Exception as e:
+        log.exception("Erreur boucle principale: %s", e); time.sleep(5)
+
+log.info("Bot arrêté proprement.")
